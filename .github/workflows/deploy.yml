@@ -88,6 +88,27 @@ jobs:
         run: |
           ASG_NAME="${{ needs.infrastructure.outputs.asg_name }}"
           TARGET_VER="${{ needs.infrastructure.outputs.launch_template_version }}"
+
+          # Cancelar cualquier Instance Refresh en progreso antes de iniciar uno nuevo
+          ACTIVE=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --query "InstanceRefreshes[?Status=='InProgress' || Status=='Pending'].InstanceRefreshId" \
+            --output text || true)
+          if [ -n "$ACTIVE" ]; then
+            echo "⚠️ Instance Refresh activo ($ACTIVE). Cancelando antes de continuar..."
+            aws autoscaling cancel-instance-refresh --auto-scaling-group-name "$ASG_NAME" || true
+            for w in $(seq 1 20); do
+              CUR=$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name "$ASG_NAME" \
+                --query "InstanceRefreshes[0].Status" --output text)
+              echo "   Esperando cancelación ($w/20): $CUR"
+              if [ "$CUR" != "InProgress" ] && [ "$CUR" != "Pending" ] && [ "$CUR" != "Cancelling" ]; then
+                break
+              fi
+              sleep 10
+            done
+          fi
+
           OUTDATED=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ASG_NAME" \
             --query "AutoScalingGroups[0].Instances[?LaunchTemplate.Version!='${TARGET_VER}'].InstanceId" \
@@ -104,7 +125,7 @@ jobs:
 
             for i in $(seq 1 40); do
               STATUS=$(aws autoscaling describe-instance-refreshes \
-                --auto-scaling-group-names "$ASG_NAME" \
+                --auto-scaling-group-name "$ASG_NAME" \
                 --instance-refresh-ids "$REFRESH_ID" \
                 --query "InstanceRefreshes[0].Status" \
                 --output text)
