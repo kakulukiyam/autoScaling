@@ -1,0 +1,46 @@
+#!/bin/bash
+set -euxo pipefail
+
+# Hash del paquete de aplicacion: ${app_bundle_etag}
+dnf install -y nginx
+
+mkdir -p /opt/autoscaling-app /usr/share/nginx/html
+aws s3 cp "s3://${app_bucket}/${app_key}" /tmp/app.zip --region "${aws_region}"
+
+python3 - <<'PYEOF'
+import zipfile
+with zipfile.ZipFile("/tmp/app.zip", "r") as zf:
+    zf.extractall("/opt/autoscaling-app")
+PYEOF
+
+cp -r /opt/autoscaling-app/web/* /usr/share/nginx/html/
+cp /opt/autoscaling-app/nginx.conf /etc/nginx/nginx.conf
+
+cat <<EOF > /etc/autoscaling-app.env
+AWS_REGION=${aws_region}
+ASG_NAME=${asg_name}
+TARGET_GROUP_ARN=${target_group_arn}
+SCALE_UP_ALARM_NAME=${scale_up_alarm_name}
+SCALE_DOWN_ALARM_NAME=${scale_down_alarm_name}
+EOF
+
+cat <<'EOF' > /etc/systemd/system/autoscaling-agent.service
+[Unit]
+Description=AutoScaling Visual Lab Backend Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/autoscaling-app.env
+ExecStart=/usr/bin/python3 /opt/autoscaling-app/server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now autoscaling-agent.service
+systemctl enable --now nginx.service

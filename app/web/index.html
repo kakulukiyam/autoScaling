@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS Auto Scaling Lab | Nginx + ALB + t3.micro</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="hero">
+      <div>
+        <span class="badge">AWS Capa Gratuita · t3.micro · Min 1 / Max 4</span>
+        <h1>Panel Visual de Auto Scaling &amp; Balanceo de Carga</h1>
+        <p class="subtitle">
+          Desplegado en <strong>Nginx + Application Load Balancer</strong> con alarmas CloudWatch de escalado hacia arriba y hacia abajo.
+        </p>
+      </div>
+      <div class="node-pill" id="current-node-pill">
+        <span class="dot"></span>
+        <div>
+          <small>Página servida por</small>
+          <strong id="initial-instance-id">Cargando...</strong>
+        </div>
+      </div>
+    </header>
+
+    <!-- KPIs principales -->
+    <section class="kpi-grid">
+      <div class="kpi-card">
+        <span class="kpi-label">Instancias Activas (InService)</span>
+        <strong class="kpi-value" id="kpi-inservice">-</strong>
+        <span class="kpi-sub" id="kpi-desired">Deseadas: - · Pendientes: -</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Límites del ASG</span>
+        <strong class="kpi-value" id="kpi-limits">1 – 4</strong>
+        <span class="kpi-sub">Tipo: t3.micro (Capa Gratuita)</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">CPU Promedio ASG (1 min)</span>
+        <strong class="kpi-value" id="kpi-cpu">-%</strong>
+        <span class="kpi-sub" id="kpi-cpu-time">Esperando métrica CloudWatch...</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Estado de Estrés en Nodo</span>
+        <strong class="kpi-value" id="kpi-stress">Inactivo</strong>
+        <span class="kpi-sub" id="kpi-stress-rem">Listo para ejecutar prueba</span>
+      </div>
+    </section>
+
+    <!-- Control de Estrés y Alarmas -->
+    <section class="two-col">
+      <div class="panel">
+        <div class="panel-header">
+          <h2>🔥 Prueba de Estrés (Escalar a Máximo: 4)</h2>
+          <span class="pill" id="stress-mode-badge">Reposo</span>
+        </div>
+        <p class="panel-desc">
+          Al presionar el botón se saturan los núcleos de CPU (~95-100%) en todas las instancias activas y nuevas del ASG. La alarma <strong>Scale-Up (≥ 45%)</strong> escalará hasta <strong>4 instancias t3.micro</strong>. Al detenerlo, la alarma <strong>Scale-Down (≤ 25% por 2 min)</strong> regresará el grupo a <strong>1 instancia</strong>.
+        </p>
+        <div class="btn-row">
+          <button id="btn-start-stress" class="btn btn-danger">
+            🔥 Ejecutar Prueba de Estrés (5 min)
+          </button>
+          <button id="btn-stop-stress" class="btn btn-secondary">
+            🛑 Detener Estrés (Escalar a 1)
+          </button>
+        </div>
+        <div id="stress-feedback" class="feedback-box">
+          Presiona <strong>Ejecutar Prueba de Estrés</strong> para iniciar el escalado automático.
+        </div>
+
+        <h3 class="sub-heading">Alarmas CloudWatch en Tiempo Real</h3>
+        <div id="alarms-container" class="alarms-grid">
+          <div class="alarm-card">Cargando alarmas...</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>📈 Historial CPU CloudWatch (últimos 20 min)</h2>
+          <span class="pill">Umbrales: ≥45% / ≤25%</span>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="cpu-chart" width="560" height="230"></canvas>
+        </div>
+        <div class="legend-row">
+          <span><i class="swatch swatch-cpu"></i> CPU Promedio ASG</span>
+          <span><i class="swatch swatch-up"></i> Alarma Scale-Up (45%)</span>
+          <span><i class="swatch swatch-down"></i> Alarma Scale-Down (25%)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Prueba Visual de Balanceo de Carga -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2>⚖️ Prueba Visual de Balanceo de Carga (ALB Round-Robin)</h2>
+        <div class="lb-controls">
+          <select id="lb-count" aria-label="Cantidad de peticiones">
+            <option value="20">20 peticiones</option>
+            <option value="40" selected>40 peticiones</option>
+            <option value="80">80 peticiones</option>
+          </select>
+          <button id="btn-lb-test" class="btn btn-primary">
+            ⚖️ Ejecutar Prueba de Balanceo
+          </button>
+          <label class="toggle-label">
+            <input type="checkbox" id="lb-auto-toggle" />
+            Auto-poll (1s)
+          </label>
+        </div>
+      </div>
+      <p class="panel-desc">
+        Envía múltiples peticiones HTTP sin caché al Application Load Balancer (<code>/api/info</code>) y visualiza qué instancia EC2 responde cada solicitud en tiempo real.
+      </p>
+
+      <div id="lb-summary" class="lb-summary">
+        Ejecuta la prueba de balanceo para observar la distribución de tráfico entre instancias.
+      </div>
+
+      <div id="lb-bars" class="lb-bars"></div>
+
+      <div class="lb-log-wrap">
+        <h3>Registro en Vivo de Peticiones</h3>
+        <div id="lb-log" class="lb-log">Sin peticiones aún.</div>
+      </div>
+    </section>
+
+    <!-- Instancias y Actividades de Auto Scaling -->
+    <section class="two-col">
+      <div class="panel">
+        <div class="panel-header">
+          <h2>🖥️ Instancias en el Auto Scaling Group</h2>
+          <span class="pill" id="asg-name-pill">-</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Instance ID</th>
+                <th>AZ</th>
+                <th>IP Privada</th>
+                <th>ASG Estado</th>
+                <th>ALB Salud</th>
+              </tr>
+            </thead>
+            <tbody id="instances-tbody">
+              <tr><td colspan="5">Cargando instancias...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>📜 Historial de Actividades de Escalado</h2>
+          <span class="pill">AWS Auto Scaling</span>
+        </div>
+        <div id="activities-list" class="activities-list">
+          Cargando actividades...
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

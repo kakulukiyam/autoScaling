@@ -1,0 +1,144 @@
+name: Despliegue AWS Auto Scaling (OIDC)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: "us-east-1"
+
+jobs:
+  infrastructure:
+    name: 🏗️ 1. Infraestructura ASG + ALB + Nginx (Terraform)
+    runs-on: ubuntu-latest
+    outputs:
+      app_url: ${{ steps.tf_outputs.outputs.app_url }}
+      alb_dns_name: ${{ steps.tf_outputs.outputs.alb_dns_name }}
+      asg_name: ${{ steps.tf_outputs.outputs.asg_name }}
+      scale_up_alarm_name: ${{ steps.tf_outputs.outputs.scale_up_alarm_name }}
+      scale_down_alarm_name: ${{ steps.tf_outputs.outputs.scale_down_alarm_name }}
+      launch_template_version: ${{ steps.tf_outputs.outputs.launch_template_version }}
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Autenticación con AWS vía OIDC (Bootstrap compartido)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::037668896847:role/citas-escolares-github-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+          role-session-name: GitHubActions-AutoScaling-Infra
+
+      - name: Verificar identidad AWS
+        run: aws sts get-caller-identity
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+          terraform_wrapper: false
+
+      - name: Inicializar Terraform
+        run: |
+          cd terraform
+          terraform init
+
+      - name: Validar Terraform
+        run: |
+          cd terraform
+          terraform validate
+
+      - name: Aplicar Infraestructura
+        run: |
+          cd terraform
+          terraform apply -auto-approve
+
+      - name: Extraer Outputs de Terraform
+        id: tf_outputs
+        run: |
+          cd terraform
+          echo "app_url=$(terraform output -raw app_url)" >> $GITHUB_OUTPUT
+          echo "alb_dns_name=$(terraform output -raw alb_dns_name)" >> $GITHUB_OUTPUT
+          echo "asg_name=$(terraform output -raw asg_name)" >> $GITHUB_OUTPUT
+          echo "scale_up_alarm_name=$(terraform output -raw scale_up_alarm_name)" >> $GITHUB_OUTPUT
+          echo "scale_down_alarm_name=$(terraform output -raw scale_down_alarm_name)" >> $GITHUB_OUTPUT
+          echo "launch_template_version=$(terraform output -raw launch_template_latest_version)" >> $GITHUB_OUTPUT
+
+  refresh-asg:
+    name: 🔄 2. Actualizar Instancias del Auto Scaling Group
+    needs: infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Autenticación con AWS vía OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::037668896847:role/citas-escolares-github-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+          role-session-name: GitHubActions-AutoScaling-Refresh
+
+      - name: Verificar si se requiere Instance Refresh
+        run: |
+          ASG_NAME="${{ needs.infrastructure.outputs.asg_name }}"
+          TARGET_VER="${{ needs.infrastructure.outputs.launch_template_version }}"
+          OUTDATED=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[?LaunchTemplate.Version!='${TARGET_VER}'].InstanceId" \
+            --output text)
+
+          if [ -n "$OUTDATED" ]; then
+            echo "Instancias con versión anterior ($OUTDATED). Iniciando Instance Refresh hacia v$TARGET_VER..."
+            REFRESH_ID=$(aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":60}' \
+              --query "InstanceRefreshId" \
+              --output text)
+            echo "InstanceRefreshId: $REFRESH_ID"
+
+            for i in $(seq 1 40); do
+              STATUS=$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-names "$ASG_NAME" \
+                --instance-refresh-ids "$REFRESH_ID" \
+                --query "InstanceRefreshes[0].Status" \
+                --output text)
+              echo "Intento $i/40 - Estado Instance Refresh: $STATUS"
+              if [ "$STATUS" = "Successful" ]; then
+                echo "✅ Instance Refresh completado."
+                exit 0
+              elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+                echo "❌ Instance Refresh falló con estado: $STATUS"
+                exit 1
+              fi
+              sleep 15
+            done
+            echo "❌ Tiempo de espera agotado esperando Instance Refresh."
+            exit 1
+          else
+            echo "✅ Todas las instancias ya ejecutan la versión v$TARGET_VER del Launch Template."
+          fi
+
+  verify-deployment:
+    name: 🧪 3. Smoke Tests (Nginx + API + Alarmas)
+    needs: [infrastructure, refresh-asg]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Ejecutar pruebas de disponibilidad post-despliegue
+        run: |
+          python .github/scripts/smoke_test.py \
+            --app-url "${{ needs.infrastructure.outputs.app_url }}" \
+            --asg-name "${{ needs.infrastructure.outputs.asg_name }}"
