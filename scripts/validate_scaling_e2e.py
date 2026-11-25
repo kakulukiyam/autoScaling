@@ -14,10 +14,18 @@ import time
 import urllib.request
 
 
-def get_json(url):
-    req = urllib.request.Request(url, headers={"Cache-Control": "no-store"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode("utf-8"))
+def get_json(url, retries=3, timeout=20):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"Cache-Control": "no-store"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception as exc:
+            last_err = exc
+            if attempt < retries - 1:
+                time.sleep(2)
+    raise last_err
 
 
 def post_json(url, payload):

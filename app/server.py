@@ -114,6 +114,10 @@ def get_instance_metadata():
 
 
 def _cpu_burner(stop_flag, end_ts):
+    try:
+        os.nice(10)
+    except Exception:
+        pass
     x = 1.0001
     while not stop_flag.is_set() and time.time() < end_ts:
         for _ in range(50000):
@@ -141,7 +145,7 @@ def _start_local_stress(duration_sec):
     duration_sec = max(10, min(900, int(duration_sec)))
     end_ts = time.time() + duration_sec
     stop_event = multiprocessing.Event()
-    num_workers = max(2, (os.cpu_count() or 2) * 2)
+    num_workers = max(2, os.cpu_count() or 2)
     workers = []
     for _ in range(num_workers):
         proc = multiprocessing.Process(target=_cpu_burner, args=(stop_event, end_ts), daemon=True)
@@ -260,12 +264,24 @@ def _start_cluster_stress(duration_sec):
     return workers, dur
 
 
+def _aws_refresh_loop():
+    while True:
+        try:
+            _refresh_aws_status_once()
+        except Exception:
+            pass
+        time.sleep(5.0)
+
+
 def fetch_aws_status():
-    global _AWS_CACHE_DATA, _AWS_CACHE_TS
-    now = time.time()
     with _AWS_CACHE_LOCK:
-        if _AWS_CACHE_DATA is not None and (now - _AWS_CACHE_TS) < 4.0:
+        if _AWS_CACHE_DATA is not None:
             return _AWS_CACHE_DATA
+    return _refresh_aws_status_once()
+
+
+def _refresh_aws_status_once():
+    global _AWS_CACHE_DATA, _AWS_CACHE_TS
 
     result = {
         "asg": None,
@@ -488,6 +504,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     threading.Thread(target=_cpu_monitor_loop, daemon=True).start()
+    threading.Thread(target=_aws_refresh_loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", 8080), Handler)
     server.serve_forever()
 
